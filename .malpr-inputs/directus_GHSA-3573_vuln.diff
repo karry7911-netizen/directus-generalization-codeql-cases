@@ -1,0 +1,752 @@
+commit 53a3194d5c6adbb37702bd5f79591b189b5f5c41
+Author: Roger Stringer <roger@directus.io>
+Date:   Tue Nov 1 15:09:31 2022 -0700
+
+    Add support for SAML Part 2 (#16145)
+    
+    * new saml branch
+    
+    * put saml info back in
+    
+    * put saml info back in
+    
+    * clean up code
+    
+    * validate saml config
+    
+    * validate schema
+    
+    * Add saml auth flow tests
+    
+    * use RelayState for redirects
+    
+    * Update tests for RelayState
+    
+    * Fix linting
+    
+    * remove validateMeta as samlify does it already
+    
+    * Fix linting
+    
+    * change catch on login
+    
+    * Update api/src/auth/drivers/saml.ts
+    
+    Co-authored-by: Aiden Foxx <aiden.foxx.mail@gmail.com>
+    
+    * remove login since not needed here
+    
+    * clear cookie if set on logout
+    
+    * empty login method
+    
+    * invalidate logout in db
+    
+    * if relayState and login failed, redirect back with a reason
+    
+    * Cleanup linter warnings
+    
+    * Remove range from packages
+    
+    * Opinions opinions opinions opinions
+    
+    Just a couple personal opinion cleanup pieces
+    
+    Co-authored-by: ian <licitdev@gmail.com>
+    Co-authored-by: Aiden Foxx <aiden.foxx.mail@gmail.com>
+    Co-authored-by: rijkvanzanten <rijkvanzanten@me.com>
+
+diff --git a/.github/workflows/blackbox-main.yml b/.github/workflows/blackbox-main.yml
+index 71189491ec..22acf4eb5d 100644
+--- a/.github/workflows/blackbox-main.yml
++++ b/.github/workflows/blackbox-main.yml
+@@ -52,9 +52,14 @@ jobs:
+         env:
+           ORACLE_DL: oracle-instantclient-basic-21.4.0.0.0-1.el8.x86_64.rpm
+ 
+-      - name: Start Databases
++      - name: Start Services (SQLite)
++        if: matrix.vendor == 'sqlite3'
++        run: docker compose -f tests-blackbox/docker-compose.yml up auth-saml -d --quiet-pull --wait
++
++      - name: Start Services (Other vendors)
+         if: matrix.vendor != 'sqlite3'
+-        run: docker compose -f tests-blackbox/docker-compose.yml up ${{ matrix.vendor }} -d --quiet-pull --wait
++        run:
++          docker compose -f tests-blackbox/docker-compose.yml up ${{ matrix.vendor }} auth-saml -d --quiet-pull --wait
+ 
+       - name: Run Tests
+         run: TEST_DB=${{ matrix.vendor }} pnpm run -w test:blackbox
+diff --git a/.github/workflows/blackbox-pr.yml b/.github/workflows/blackbox-pr.yml
+index e4ef3169b0..eda59ff5bf 100644
+--- a/.github/workflows/blackbox-pr.yml
++++ b/.github/workflows/blackbox-pr.yml
+@@ -30,5 +30,8 @@ jobs:
+       - name: Prepare
+         uses: ./.github/actions/prepare
+ 
++      - name: Start Services
++        run: docker compose -f tests-blackbox/docker-compose.yml up auth-saml -d --quiet-pull --wait
++
+       - name: Run Tests
+         run: TEST_DB=sqlite3 pnpm run -w test:blackbox
+diff --git a/api/package.json b/api/package.json
+index ae4969cd59..24e4a1bd72 100644
+--- a/api/package.json
++++ b/api/package.json
+@@ -153,6 +153,7 @@
+ 		"rate-limiter-flexible": "2.3.12",
+ 		"resolve-cwd": "3.0.0",
+ 		"rollup": "3.2.3",
++		"samlify": "2.8.6",
+ 		"sanitize-html": "2.7.2",
+ 		"sharp": "0.31.1",
+ 		"snappy": "7.2.0",
+@@ -178,6 +179,7 @@
+ 	},
+ 	"gitHead": "24621f3934dc77eb23441331040ed13c676ceffd",
+ 	"devDependencies": {
++		"@authenio/samlify-node-xmllint": "2.0.0",
+ 		"@otplib/preset-default": "12.0.1",
+ 		"@types/async": "3.2.15",
+ 		"@types/busboy": "1.5.0",
+diff --git a/api/src/auth.ts b/api/src/auth.ts
+index 6b6d04d07e..80a95b7df0 100644
+--- a/api/src/auth.ts
++++ b/api/src/auth.ts
+@@ -2,7 +2,8 @@ import getDatabase from './database';
+ import env from './env';
+ import logger from './logger';
+ import { AuthDriver } from './auth/auth';
+-import { LocalAuthDriver, OAuth2AuthDriver, OpenIDAuthDriver, LDAPAuthDriver } from './auth/drivers';
++import { LocalAuthDriver, OAuth2AuthDriver, OpenIDAuthDriver, LDAPAuthDriver, SAMLAuthDriver } from './auth/drivers';
++
+ import { DEFAULT_AUTH_PROVIDER } from './constants';
+ import { InvalidConfigException } from './exceptions';
+ import { AuthDriverOptions } from './types';
+@@ -79,5 +80,8 @@ function getProviderInstance(
+ 
+ 		case 'ldap':
+ 			return new LDAPAuthDriver(options, config);
++
++		case 'saml':
++			return new SAMLAuthDriver(options, config);
+ 	}
+ }
+diff --git a/api/src/auth/drivers/index.ts b/api/src/auth/drivers/index.ts
+index b30aa61cce..e204e61673 100644
+--- a/api/src/auth/drivers/index.ts
++++ b/api/src/auth/drivers/index.ts
+@@ -2,3 +2,4 @@ export * from './local';
+ export * from './oauth2';
+ export * from './openid';
+ export * from './ldap';
++export * from './saml';
+diff --git a/api/src/auth/drivers/saml.ts b/api/src/auth/drivers/saml.ts
+new file mode 100644
+index 0000000000..4f60fa9632
+--- /dev/null
++++ b/api/src/auth/drivers/saml.ts
+@@ -0,0 +1,185 @@
++import * as validator from '@authenio/samlify-node-xmllint';
++import { BaseException } from '@directus/shared/exceptions';
++import express, { Router } from 'express';
++import * as samlify from 'samlify';
++import { getAuthProvider } from '../../auth';
++import { COOKIE_OPTIONS } from '../../constants';
++import env from '../../env';
++import { InvalidCredentialsException, InvalidProviderException } from '../../exceptions';
++import { RecordNotUniqueException } from '../../exceptions/database/record-not-unique';
++import logger from '../../logger';
++import { respond } from '../../middleware/respond';
++import { AuthenticationService, UsersService } from '../../services';
++import { AuthDriverOptions, User } from '../../types';
++import asyncHandler from '../../utils/async-handler';
++import { getConfigFromEnv } from '../../utils/get-config-from-env';
++import { LocalAuthDriver } from './local';
++
++// tell samlify to use validator...
++samlify.setSchemaValidator(validator);
++
++export class SAMLAuthDriver extends LocalAuthDriver {
++	idp: any;
++	sp: any;
++	usersService: UsersService;
++	config: Record<string, any>;
++
++	constructor(options: AuthDriverOptions, config: Record<string, any>) {
++		super(options, config);
++
++		this.config = config;
++		this.usersService = new UsersService({ knex: this.knex, schema: this.schema });
++
++		this.sp = samlify.ServiceProvider(getConfigFromEnv(`AUTH_${config.provider.toUpperCase()}_SP`));
++		this.idp = samlify.IdentityProvider(getConfigFromEnv(`AUTH_${config.provider.toUpperCase()}_IDP`));
++	}
++
++	async fetchUserID(identifier: string) {
++		const user = await this.knex
++			.select('id')
++			.from('directus_users')
++			.whereRaw('LOWER(??) = ?', ['external_identifier', identifier.toLowerCase()])
++			.first();
++
++		return user?.id;
++	}
++
++	async getUserID(payload: Record<string, any>) {
++		const { provider, emailKey, identifierKey, givenNameKey, familyNameKey, allowPublicRegistration } = this.config;
++
++		const email = payload[emailKey ?? 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'];
++		const identifier = payload[identifierKey ?? 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier'];
++
++		const userID = await this.fetchUserID(identifier);
++
++		if (userID) return userID;
++
++		if (!allowPublicRegistration) {
++			logger.trace(`[SAML] User doesn't exist, and public registration not allowed for provider "${provider}"`);
++			throw new InvalidCredentialsException();
++		}
++
++		const firstName = payload[givenNameKey ?? 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'];
++		const lastName = payload[familyNameKey ?? 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'];
++
++		try {
++			return await this.usersService.createOne({
++				provider,
++				first_name: firstName,
++				last_name: lastName,
++				email: email,
++				external_identifier: identifier.toLowerCase(),
++				role: this.config.defaultRoleId,
++			});
++		} catch (error) {
++			if (error instanceof RecordNotUniqueException) {
++				logger.warn(error, '[SAML] Failed to register user. User not unique');
++				throw new InvalidProviderException();
++			}
++
++			throw error;
++		}
++	}
++
++	// There's no local checks to be done when the user is authenticated in the IDP
++	async login(_user: User): Promise<void> {
++		return;
++	}
++}
++
++export function createSAMLAuthRouter(providerName: string) {
++	const router = Router();
++
++	router.get(
++		'/metadata',
++		asyncHandler(async (_req, res) => {
++			const { sp } = getAuthProvider(providerName) as SAMLAuthDriver;
++			return res.header('Content-Type', 'text/xml').send(sp.getMetadata());
++		})
++	);
++
++	router.get(
++		'/',
++		asyncHandler(async (req, res) => {
++			const { sp, idp } = getAuthProvider(providerName) as SAMLAuthDriver;
++			const { context: url } = await sp.createLoginRequest(idp, 'redirect');
++			const parsedUrl = new URL(url);
++
++			if (req.query.redirect) {
++				parsedUrl.searchParams.append('RelayState', req.query.redirect as string);
++			}
++
++			return res.redirect(parsedUrl.toString());
++		})
++	);
++
++	router.post(
++		'/logout',
++		asyncHandler(async (req, res) => {
++			const { sp, idp } = getAuthProvider(providerName) as SAMLAuthDriver;
++			const { context } = await sp.createLogoutRequest(idp, 'redirect', req.body);
++
++			const authService = new AuthenticationService({ accountability: req.accountability, schema: req.schema });
++
++			if (req.cookies[env.REFRESH_TOKEN_COOKIE_NAME]) {
++				const currentRefreshToken = req.cookies[env.REFRESH_TOKEN_COOKIE_NAME];
++
++				if (currentRefreshToken) {
++					await authService.logout(currentRefreshToken);
++					res.clearCookie(env.REFRESH_TOKEN_COOKIE_NAME, COOKIE_OPTIONS);
++				}
++			}
++
++			return res.redirect(context);
++		})
++	);
++
++	router.post(
++		'/acs',
++		express.urlencoded({ extended: false }),
++		asyncHandler(async (req, res, next) => {
++			const relayState: string | undefined = req.body?.RelayState;
++
++			try {
++				const { sp, idp } = getAuthProvider(providerName) as SAMLAuthDriver;
++				const { extract } = await sp.parseLoginResponse(idp, 'post', req);
++
++				const authService = new AuthenticationService({ accountability: req.accountability, schema: req.schema });
++				const { accessToken, refreshToken, expires } = await authService.login(providerName, extract.attributes);
++
++				res.locals.payload = {
++					data: {
++						access_token: accessToken,
++						refresh_token: refreshToken,
++						expires,
++					},
++				};
++
++				if (relayState) {
++					res.cookie(env.REFRESH_TOKEN_COOKIE_NAME, refreshToken, COOKIE_OPTIONS);
++					return res.redirect(relayState);
++				}
++
++				return next();
++			} catch (error: any) {
++				if (relayState) {
++					let reason = 'UNKNOWN_EXCEPTION';
++
++					if (error instanceof BaseException) {
++						reason = error.code;
++					} else {
++						logger.warn(error, `[SAML] Unexpected error during SAML login`);
++					}
++
++					return res.redirect(`${relayState.split('?')[0]}?reason=${reason}`);
++				}
++
++				logger.warn(error, `[SAML] Unexpected error during SAML login`);
++				throw error;
++			}
++		}),
++		respond
++	);
++
++	return router;
++}
+diff --git a/api/src/controllers/auth.ts b/api/src/controllers/auth.ts
+index 42771142b2..d0a429e96a 100644
+--- a/api/src/controllers/auth.ts
++++ b/api/src/controllers/auth.ts
+@@ -11,6 +11,7 @@ import {
+ 	createOAuth2AuthRouter,
+ 	createOpenIDAuthRouter,
+ 	createLDAPAuthRouter,
++	createSAMLAuthRouter,
+ } from '../auth/drivers';
+ import { DEFAULT_AUTH_PROVIDER } from '../constants';
+ import { getIPFromReq } from '../utils/get-ip-from-req';
+@@ -39,6 +40,10 @@ for (const authProvider of authProviders) {
+ 		case 'ldap':
+ 			authRouter = createLDAPAuthRouter(authProvider.name);
+ 			break;
++
++		case 'saml':
++			authRouter = createSAMLAuthRouter(authProvider.name);
++			break;
+ 	}
+ 
+ 	if (!authRouter) {
+diff --git a/api/src/env.ts b/api/src/env.ts
+index c1cd74389c..37b67099b4 100644
+--- a/api/src/env.ts
++++ b/api/src/env.ts
+@@ -136,6 +136,8 @@ const allowedEnvironmentVars = [
+ 	'AUTH_.+_GROUP_DN',
+ 	'AUTH_.+_GROUP_ATTRIBUTE',
+ 	'AUTH_.+_GROUP_SCOPE',
++	'AUTH_.+_IDP.+',
++	'AUTH_.+_SP.+',
+ 	// extensions
+ 	'EXTENSIONS_PATH',
+ 	'EXTENSIONS_AUTO_RELOAD',
+diff --git a/app/src/constants.ts b/app/src/constants.ts
+index addc15962a..e5fc688999 100644
+--- a/app/src/constants.ts
++++ b/app/src/constants.ts
+@@ -147,4 +147,4 @@ export const FIELD_TYPES_SELECT: Array<{ value: Type; text: string } | { divider
+ export const DEFAULT_AUTH_PROVIDER = 'local';
+ export const DEFAULT_AUTH_DRIVER = 'default';
+ 
+-export const AUTH_SSO_DRIVERS = ['oauth2', 'openid'];
++export const AUTH_SSO_DRIVERS = ['oauth2', 'openid', 'saml'];
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index dd99ffc681..b731b13cc0 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -66,6 +66,7 @@ importers:
+ 
+   api:
+     specifiers:
++      '@authenio/samlify-node-xmllint': 2.0.0
+       '@aws-sdk/client-ses': 3.190.0
+       '@directus/app': workspace:*
+       '@directus/drive': workspace:*
+@@ -197,6 +198,7 @@ importers:
+       resolve-cwd: 3.0.0
+       rimraf: 3.0.2
+       rollup: 3.2.3
++      samlify: 2.8.6
+       sanitize-html: 2.7.2
+       sharp: 0.31.1
+       snappy: 7.2.0
+@@ -293,6 +295,7 @@ importers:
+       rate-limiter-flexible: 2.3.12
+       resolve-cwd: 3.0.0
+       rollup: 3.2.3
++      samlify: 2.8.6
+       sanitize-html: 2.7.2
+       sharp: 0.31.1
+       snappy: 7.2.0
+@@ -315,6 +318,7 @@ importers:
+       sqlite3: 5.1.2
+       tedious: 15.1.0
+     devDependencies:
++      '@authenio/samlify-node-xmllint': 2.0.0_samlify@2.8.6
+       '@otplib/preset-default': 12.0.1
+       '@types/async': 3.2.15
+       '@types/busboy': 1.5.0
+@@ -941,6 +945,23 @@ packages:
+       openapi-types: 12.0.2
+     dev: true
+ 
++  /@authenio/samlify-node-xmllint/2.0.0_samlify@2.8.6:
++    resolution: {integrity: sha512-V9cQ0CHqu3JwOmbSecGPUnzIES5kHxD00FEZKnWh90ksQUJG5/TscV2r9XLbKp7MlRMOSUfWxecM35xPSLFdSg==}
++    peerDependencies:
++      samlify: '>= 2.6.0'
++    dependencies:
++      node-xmllint: 1.0.0
++      samlify: 2.8.6
++    dev: true
++
++  /@authenio/xml-encryption/2.0.1:
++    resolution: {integrity: sha512-NJi1gH2NxNp8GhMFYsFMKfKrMQoRKir8pcZu6SwipsIjUu9sYI2uh+MMmQU/8ubyy84ptcoQ2cmB5FBQZLKkMQ==}
++    engines: {node: '>=12'}
++    dependencies:
++      '@xmldom/xmldom': 0.8.3
++      escape-html: 1.0.3
++      xpath: 0.0.32
++
+   /@aws-crypto/ie11-detection/2.0.0:
+     resolution: {integrity: sha512-pkVXf/dq6PITJ0jzYZ69VhL8VFOFoPZLZqtU/12SGnzYuJOOGNfF41q9GxdI1yqC8R13Rq3jOLKDFpUJFT5eTA==}
+     dependencies:
+@@ -7348,6 +7369,10 @@ packages:
+       '@xtuc/long': 4.2.2
+     dev: true
+ 
++  /@xmldom/xmldom/0.8.3:
++    resolution: {integrity: sha512-Lv2vySXypg4nfa51LY1nU8yDAGo/5YwF+EY/rUZgIbfvwVARcd67ttCM8SMsTeJy51YhHYavEq+FS6R0hW9PFQ==}
++    engines: {node: '>=10.0.0'}
++
+   /@xtuc/ieee754/1.2.0:
+     resolution: {integrity: sha512-DX8nKgqcGwsc0eJSqYt5lwP4DH5FlHnmuWWBRy7X0NcaGR0ZtuyeESgMwTYVEtxmsNGY+qit4QYT/MIYTOTPeA==}
+     dev: true
+@@ -7829,7 +7854,6 @@ packages:
+     resolution: {integrity: sha512-ix/FxPn0MDjeyJ7i/yoHGFt/EX6LyNbxSEhPPXODPL+KB0VPk86UYfL0lMdy+KCnv+fmvIzySwaK5COwqVbWTQ==}
+     dependencies:
+       safer-buffer: 2.1.2
+-    dev: false
+ 
+   /assert-never/1.2.1:
+     resolution: {integrity: sha512-TaTivMB6pYI1kXwrFlEhLeGfOqoDNdTxjCdwRfFFkEA30Eu+k48W34nlok2EYWJfFFzqaEmichdNM7th6M5HNw==}
+@@ -15432,7 +15456,6 @@ packages:
+   /node-forge/1.3.1:
+     resolution: {integrity: sha512-dPEtOeMvF9VMcYV/1Wb8CPoVAXtp6MKMlcbAt4ddqmGqUJ6fQZFXkNZNkNlfevtNkGtaSoXf/vNNNSvgrdXwtA==}
+     engines: {node: '>= 6.13.0'}
+-    dev: false
+ 
+   /node-gyp/8.4.1:
+     resolution: {integrity: sha512-olTJRgUtAb/hOXG0E93wZDs5YiJlgbXxTwQAFHyNlRsXQnYzUaF2aGgujZbw+hR8aF4ZG/rST57bWMWD16jr9w==}
+@@ -15494,6 +15517,15 @@ packages:
+   /node-releases/2.0.6:
+     resolution: {integrity: sha512-PiVXnNuFm5+iYkLBNeq5211hvO38y63T0i2KKh2KnUs3RpzJ+JtODFjkD8yjLwnDkTYF1eKXheUwdssR+NRZdg==}
+ 
++  /node-rsa/1.1.1:
++    resolution: {integrity: sha512-Jd4cvbJMryN21r5HgxQOpMEqv+ooke/korixNNK3mGqfGJmy0M77WDDzo/05969+OkMy3XW1UuZsSmW9KQm7Fw==}
++    dependencies:
++      asn1: 0.2.6
++
++  /node-xmllint/1.0.0:
++    resolution: {integrity: sha512-71UV2HRUP+djvHpdyatiuv+Y1o8hI4ZI7bMfuuoACMLR1JJCErM4WXAclNeHd6BgHXkqeqnnAk3wpDkSQWmFXw==}
++    dev: true
++
+   /nodemailer-mailgun-transport/2.1.5_lodash@4.17.21:
+     resolution: {integrity: sha512-hF7POkaxFgMvYEd5aHLaQJI2511ld+aQlQi7JH6bGjhjlZ33cIbTB9PimlIrLu5XC3z76Kde6e65OIwL9lOdTA==}
+     requiresBuild: true
+@@ -16075,7 +16107,6 @@ packages:
+ 
+   /pako/1.0.11:
+     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
+-    dev: true
+ 
+   /parallel-transform/1.2.0:
+     resolution: {integrity: sha512-P2vSmIu38uIlvdcU7fDkyrxj33gTUy/ABO5ZUbGowxNCopBq/OoD42bP4UmMrJoPyk4Uqf0mu3mtWBhHCZD8yg==}
+@@ -18197,6 +18228,20 @@ packages:
+   /safer-buffer/2.1.2:
+     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
+ 
++  /samlify/2.8.6:
++    resolution: {integrity: sha512-G40xfnFvn4Y34Wlwwui004f+yER7tjWn6wioGGB6LcDHz3bssNrARBmPDkAr5HyMMkREg/GQo7I6tGfAjsYMew==}
++    dependencies:
++      '@authenio/xml-encryption': 2.0.1
++      '@xmldom/xmldom': 0.8.3
++      camelcase: 6.3.0
++      node-forge: 1.3.1
++      node-rsa: 1.1.1
++      pako: 1.0.11
++      uuid: 8.3.2
++      xml: 1.0.1
++      xml-crypto: 3.0.0
++      xpath: 0.0.32
++
+   /sane/4.1.0:
+     resolution: {integrity: sha512-hhbzAgTIX8O7SHfp2c8/kREfEn4qO/9q8C9beyY6+tvZ87EpoZ3i1RIEvp27YBswnNbY9mWd6paKVmKbAgLfZA==}
+     engines: {node: 6.* || 8.* || >= 10.*}
+@@ -21188,11 +21233,21 @@ packages:
+       default-browser-id: 1.0.4
+     dev: true
+ 
++  /xml-crypto/3.0.0:
++    resolution: {integrity: sha512-vdmZOsWgjnFxYGY7OwCgxs+HLWzwvLgX2n0NSYWh3gudckQyNOmtJTT6ooOWEvDZSpC9qRjRs2bEXqKFi1oCHw==}
++    engines: {node: '>=0.4.0'}
++    dependencies:
++      '@xmldom/xmldom': 0.8.3
++      xpath: 0.0.32
++
+   /xml-name-validator/4.0.0:
+     resolution: {integrity: sha512-ICP2e+jsHvAj2E2lIHxa5tjXRlKDJo4IdvPvCXbXQGdzSfmSpNVyIKMvoZHjDY9DP0zV17iI85o90vRFXNccRw==}
+     engines: {node: '>=12'}
+     dev: true
+ 
++  /xml/1.0.1:
++    resolution: {integrity: sha512-huCv9IH9Tcf95zuYCsQraZtWnJvBtLVE0QHMOs8bWyZAFZNDcYjsPq1nEx8jKA9y+Beo9v+7OBPRisQTjinQMw==}
++
+   /xml2js/0.4.19:
+     resolution: {integrity: sha512-esZnJZJOiJR9wWKMyuvSE1y6Dq5LCuJanqhxslH2bxM6duahNZ+HMpCLhBQGZkbX6xRf8x1Y2eJlgt2q3qo49Q==}
+     dependencies:
+@@ -21220,6 +21275,10 @@ packages:
+     resolution: {integrity: sha512-nquOebG4sngPmGPICTS5EnxqhKbCmz5Ox5hsszI2T6U5qdrJizBc+0ilYSEjTSzU0yZcmvppztXe/5Al5fUwdg==}
+     dev: false
+ 
++  /xpath/0.0.32:
++    resolution: {integrity: sha512-rxMJhSIoiO8vXcWvSifKqhvV96GjiD5wYb8/QHdoRyQvraTpp4IEv944nhGausZZ3u7dhQXteZuZbaqfpB7uYw==}
++    engines: {node: '>=0.6.0'}
++
+   /xtend/4.0.2:
+     resolution: {integrity: sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==}
+     engines: {node: '>=0.4'}
+diff --git a/tests-blackbox/common/config.ts b/tests-blackbox/common/config.ts
+index 649a5a2143..2c1efabe95 100644
+--- a/tests-blackbox/common/config.ts
++++ b/tests-blackbox/common/config.ts
+@@ -30,6 +30,19 @@ const logLevel = process.env.TEST_SAVE_LOGS
+ 		: 'info'
+ 	: 'error';
+ 
++const directusAuthConfig = {
++	AUTH_PROVIDERS: 'saml',
++	AUTH_SAML_DRIVER: 'saml',
++	AUTH_SAML_ALLOW_PUBLIC_REGISTRATION: 'true',
++	AUTH_SAML_SP_metadata:
++		'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="saml-test"><md:SPSSODescriptor WantAssertionsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>MIIDDTCCAfWgAwIBAgIJQC7RaeKX30qDMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNVBAMTGWRldi1md3h5bWRvMC51cy5hdXRoMC5jb20wHhcNMjIwODE5MjA1OTEwWhcNMzYwNDI3MjA1OTEwWjAkMSIwIAYDVQQDExlkZXYtZnd4eW1kbzAudXMuYXV0aDAuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0TN0Doc8qop69i0bgGuynPQpJRat17xlsbphSWCnACc6DYbFBQ3n+cft8AiTzI7VISLazwlWOp30zhTMwZlrXMo1flG9qJl/2T+BLohRMw0ScCQk8Aq1cWRzZLb4Oku6PdefHrpsg6Wjn87m6R2Yrhmz33Vq2QYRwNsKhWRhhB2ajpMj8GsvFKG0FGPD/AJ1bGXcdsMOaQZxIiZ3Xcy9Ng8jAHvE12sIH8w14pmIidO15XFjlvtpNTxSl0qV0lmzKM0nN4EqlK0vTy4NwFk3xR/UmgQo5tYzqvRBqfzRO7vpOwbp1SWQ/c8JlI1ulLzt1uJzfvWsp8MSD/QRhxg93QIDAQABo0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBT60jtXFsHPoyL42prgUG7wQTaWcTAOBgNVHQ8BAf8EBAMCAoQwDQYJKoZIhvcNAQELBQADggEBAKFLvyUbywoLYLOtsgHv9S2qingx2Q2jmYChqj4CQxPaWRpS/qBaZXnjVETZrMFDjf8HyMf2qn9uwKvtJehfPXpG8D+VuZWfsriTn94pXuELbiekHZ0Qlo1acbjUwyIeKoMNMk7wjGe8qb4gar6noT6PvAbyv1uzzkdyIUmQDzSS/ZOdRW0cwHG6oD/PdzKOPZxUZtQcq23Y/hbK/JpDiKtt1oO/svpd6tMmi6VezVB47gvUqEKMB3B5PI2Rdn+lA9tFPY2tfZtzOPaT5YQJkpp7tAWdMaUir+M8BhY8EjgtK1ZhJ7h2pW+UuOwkNsikgbf9EoUvDDZak65rXNqCCpQ=</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress</md:NameIDFormat><md:AssertionConsumerService isDefault="true" index="0" Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="http://host.docker.internal:8055/auth/login/saml/acs" /></md:SPSSODescriptor></md:EntityDescriptor>',
++	AUTH_SAML_IDP_metadata:
++		'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="http://localhost:8880/simplesaml/saml2/idp/metadata.php"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>MIIDXTCCAkWgAwIBAgIJALmVVuDWu4NYMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwHhcNMTYxMjMxMTQzNDQ3WhcNNDgwNjI1MTQzNDQ3WjBFMQswCQYDVQQGEwJBVTETMBEGA1UECAwKU29tZS1TdGF0ZTEhMB8GA1UECgwYSW50ZXJuZXQgV2lkZ2l0cyBQdHkgTHRkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzUCFozgNb1h1M0jzNRSCjhOBnR+uVbVpaWfXYIR+AhWDdEe5ryY+CgavOg8bfLybyzFdehlYdDRgkedEB/GjG8aJw06l0qF4jDOAw0kEygWCu2mcH7XOxRt+YAH3TVHa/Hu1W3WjzkobqqqLQ8gkKWWM27fOgAZ6GieaJBN6VBSMMcPey3HWLBmc+TYJmv1dbaO2jHhKh8pfKw0W12VM8P1PIO8gv4Phu/uuJYieBWKixBEyy0lHjyixYFCR12xdh4CA47q958ZRGnnDUGFVE1QhgRacJCOZ9bd5t9mr8KLaVBYTCJo5ERE8jymab5dPqe5qKfJsCZiqWglbjUo9twIDAQABo1AwTjAdBgNVHQ4EFgQUxpuwcs/CYQOyui+r1G+3KxBNhxkwHwYDVR0jBBgwFoAUxpuwcs/CYQOyui+r1G+3KxBNhxkwDAYDVR0TBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAAiWUKs/2x/viNCKi3Y6blEuCtAGhzOOZ9EjrvJ8+COH3Rag3tVBWrcBZ3/uhhPq5gy9lqw4OkvEws99/5jFsX1FJ6MKBgqfuy7yh5s1YfM0ANHYczMmYpZeAcQf2CGAaVfwTTfSlzNLsF2lW/ly7yapFzlYSJLGoVE+OHEu8g5SlNACUEfkXw+5Eghh+KzlIN7R6Q7r2ixWNFBC/jWf7NKUfJyX8qIG5md1YUeT6GBW9Bm2/1/RiO24JTaYlfLdKK9TYb8sG5B+OLab2DImG99CJ25RkAcSobWNF5zD0O6lgOo3cEdB/ksCq3hmtlC/DlLZ/D8CJ+7VuZnS1rR2naQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="http://localhost:8880/simplesaml/saml2/idp/SingleLogoutService.php" /><md:NameIDFormat>urn:oasis:names:tc:SAML:2.0:nameid-format:transient</md:NameIDFormat><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="http://localhost:8880/simplesaml/saml2/idp/SSOService.php" /></md:IDPSSODescriptor></md:EntityDescriptor>',
++	AUTH_SAML_DEFAULT_ROLE_ID: 'd70c0943-5b55-4c5d-a613-f539a27a57f5',
++	AUTH_SAML_IDENTIFIER_KEY: 'uid',
++	AUTH_SAML_EMAIL_KEY: 'email',
++};
++
+ const directusConfig = {
+ 	...process.env,
+ 	ADMIN_EMAIL: 'admin@example.com',
+@@ -43,6 +56,7 @@ const directusConfig = {
+ 	LOG_LEVEL: logLevel,
+ 	SERVE_APP: 'false',
+ 	DB_EXCLUDE_TABLES: 'knex_migrations,knex_migrations_lock,spatial_ref_sys,sysdiagrams',
++	...directusAuthConfig,
+ };
+ 
+ const config: Config = {
+diff --git a/tests-blackbox/docker-compose.yml b/tests-blackbox/docker-compose.yml
+index 0342499b92..ffaf4d3e85 100644
+--- a/tests-blackbox/docker-compose.yml
++++ b/tests-blackbox/docker-compose.yml
+@@ -87,3 +87,13 @@ services:
+     command: start-single-node --cluster-name=example-single-node --insecure
+     ports:
+       - 6106:26257
++
++  auth-saml:
++    image: kristophjunge/test-saml-idp
++    ports:
++      - 8880:8080
++    environment:
++      - SIMPLESAMLPHP_SP_ENTITY_ID=saml-test
++      - SIMPLESAMLPHP_SP_ASSERTION_CONSUMER_SERVICE=http://localhost:8080/auth/login/saml/acs
++    extra_hosts:
++      - "host.docker.internal:host-gateway"
+diff --git a/tests-blackbox/routes/auth/saml.test.ts b/tests-blackbox/routes/auth/saml.test.ts
+new file mode 100644
+index 0000000000..5495252ca2
+--- /dev/null
++++ b/tests-blackbox/routes/auth/saml.test.ts
+@@ -0,0 +1,150 @@
++import { getUrl } from '@common/config';
++import request from 'supertest';
++import vendors from '@common/get-dbs-to-test';
++
++describe('/auth/login/saml', () => {
++	const authCookies: Record<string, string> = {};
++
++	describe('GET /', () => {
++		describe('when incorrect credential is provided', () => {
++			describe('returns no authenticated cookie', () => {
++				it.each(vendors)('%s', async (vendor) => {
++					// Action
++					const loginPage = await request('http://localhost:8880')
++						.get(`/simplesaml/module.php/core/authenticate.php?as=example-userpass`)
++						.expect(302);
++
++					const cookies = loginPage.headers['set-cookie'].map((cookie: string) => cookie.split(';')[0]).join(';');
++
++					const AuthState = decodeURIComponent(String(loginPage.headers.location)).split('AuthState=')[1];
++
++					const response = await request('http://localhost:8880')
++						.post(`/simplesaml/module.php/core/loginuserpass.php?`)
++						.set('Cookie', cookies)
++						.set('Content-Type', 'application/x-www-form-urlencoded')
++						.send({
++							username: 'user1',
++							password: 'user2pass',
++							AuthState,
++						})
++						.expect(200);
++
++					authCookies[vendor] = response.headers['set-cookie'].map((cookie: string) => cookie.split(';')[0]).join(';');
++
++					// Assert
++					expect(authCookies[vendor]).toMatch(/PHPSESSIDIDP/);
++					expect(authCookies[vendor]).not.toMatch(/SimpleSAMLAuthTokenIdp/);
++				});
++			});
++		});
++
++		describe('when correct credential is provided', () => {
++			describe('returns authenticated cookie', () => {
++				it.each(vendors)('%s', async (vendor) => {
++					// Action
++					const loginPage = await request('http://localhost:8880')
++						.get(`/simplesaml/module.php/core/authenticate.php?as=example-userpass`)
++						.expect(302);
++
++					const cookies = loginPage.headers['set-cookie'].map((cookie: string) => cookie.split(';')[0]).join(';');
++
++					const AuthState = decodeURIComponent(String(loginPage.headers.location)).split('AuthState=')[1];
++
++					const response = await request('http://localhost:8880')
++						.post(`/simplesaml/module.php/core/loginuserpass.php?`)
++						.set('Cookie', cookies)
++						.set('Content-Type', 'application/x-www-form-urlencoded')
++						.send({
++							username: 'user1',
++							password: 'user1pass',
++							AuthState,
++						})
++						.expect(303);
++
++					authCookies[vendor] = response.headers['set-cookie'].map((cookie: string) => cookie.split(';')[0]).join(';');
++
++					// Assert
++					expect(authCookies[vendor]).toMatch(/PHPSESSIDIDP/);
++					expect(authCookies[vendor]).toMatch(/SimpleSAMLAuthTokenIdp/);
++				});
++			});
++		});
++	});
++
++	describe('POST /acs', () => {
++		describe('when no redirect is provided', () => {
++			describe('returns directus refresh token in JSON', () => {
++				it.each(vendors)('%s', async (vendor) => {
++					// Action
++					const samlLogin = await request(getUrl(vendor)).get('/auth/login/saml').expect(302);
++					const samlRedirectUrl = String(samlLogin.headers.location).split('/simplesaml/');
++
++					const authResponse = await request(samlRedirectUrl[0])
++						.get(`/simplesaml/${samlRedirectUrl[1]}`)
++						.set('Cookie', authCookies[vendor]);
++
++					expect(authResponse.statusCode).toBe(200);
++
++					const SAMLResponse = authResponse.text
++						.split('<input type="hidden" name="SAMLResponse" value="')[1]
++						.split('" />')[0];
++
++					const acsResponse = await request(getUrl(vendor))
++						.post('/auth/login/saml/acs')
++						.send({
++							SAMLResponse,
++						})
++						.expect(200);
++
++					// Assert
++					expect(acsResponse.body.data).toEqual(
++						expect.objectContaining({
++							access_token: expect.any(String),
++							expires: expect.any(Number),
++							refresh_token: expect.any(String),
++						})
++					);
++				});
++			});
++		});
++
++		describe('when redirect is provided', () => {
++			describe('returns directus refresh token in cookie', () => {
++				it.each(vendors)('%s', async (vendor) => {
++					// Action
++					const samlLogin = await request(getUrl(vendor))
++						.get(`/auth/login/saml?redirect=${getUrl(vendor)}/admin/login?continue`)
++						.expect(302);
++					const samlRedirectUrl = String(samlLogin.headers.location).split('/simplesaml/');
++
++					const authResponse = await request(samlRedirectUrl[0])
++						.get(`/simplesaml/${samlRedirectUrl[1]}`)
++						.set('Cookie', authCookies[vendor]);
++
++					expect(authResponse.statusCode).toBe(200);
++
++					const SAMLResponse = authResponse.text
++						.split('<input type="hidden" name="SAMLResponse" value="')[1]
++						.split('" />')[0];
++
++					const RelayState = authResponse.text
++						.split('<input type="hidden" name="RelayState" value="')[1]
++						.split('" />')[0];
++
++					const acsResponse = await request(getUrl(vendor))
++						.post('/auth/login/saml/acs')
++						.send({
++							SAMLResponse,
++							RelayState,
++						})
++						.expect(302);
++
++					const cookies = acsResponse.headers['set-cookie'].map((cookie: string) => cookie.split(';')[0]).join(';');
++
++					// Assert
++					expect(cookies).toMatch(/directus_refresh_token/);
++				});
++			});
++		});
++	});
++});
