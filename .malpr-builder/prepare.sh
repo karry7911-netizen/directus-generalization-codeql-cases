@@ -5,9 +5,38 @@ workspace="${GITHUB_WORKSPACE:?}"
 metadata="$workspace/.malpr-builder/cases.tsv"
 source_repo="$(<"$workspace/.malpr-builder/source_repo.txt")"
 coderabbit_disable="$workspace/.malpr-builder/disable-coderabbit.yaml"
+publish_mode="$(<"$workspace/.malpr-builder/publish-mode.txt")"
 cache="$(mktemp -d)"
 worktree_parent="$(mktemp -d)"
 results="$workspace/.malpr-builder/prepared-results.tsv"
+
+disable_upstream_workflow_triggers() {
+  local workflow_file temporary_file
+  [[ -d "$worktree/.github/workflows" ]] || return 0
+  while IFS= read -r -d '' workflow_file; do
+    temporary_file="$workflow_file.malpr-disabled"
+    awk '
+      BEGIN { skipping_on_block = 0 }
+      {
+        if (!skipping_on_block && $0 ~ /^on:[[:space:]]*/) {
+          print "on:"
+          print "  workflow_dispatch:"
+          if ($0 ~ /^on:[[:space:]]*$/) skipping_on_block = 1
+          next
+        }
+        if (skipping_on_block) {
+          if ($0 ~ /^[^[:space:]#]/) {
+            skipping_on_block = 0
+            print
+          }
+          next
+        }
+        print
+      }
+    ' "$workflow_file" >"$temporary_file"
+    mv -- "$temporary_file" "$workflow_file"
+  done < <(find "$worktree/.github/workflows" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
+}
 
 cleanup() {
   rm -rf -- "$cache" "$worktree_parent"
@@ -50,7 +79,13 @@ while IFS=$'\t' read -r public_case_id case_id base_ref diff_file; do
   git -C "$cache" fetch --no-tags --depth=1 upstream "$base_ref:$upstream_ref"
   git -C "$cache" worktree add --detach "$worktree" "$upstream_ref"
 
-  if ! grep -q '^diff --git a/\.github/workflows/' "$patch"; then
+  if grep -q '^diff --git a/\.github/workflows/' "$patch"; then
+    # Preserve workflow files that are part of the business patch, while making
+    # every upstream workflow dispatch-only on both sides of the evaluation PR.
+    # The fixed CodeQL workflow is attached later and remains the sole
+    # pull_request-triggered workflow.
+    disable_upstream_workflow_triggers
+  else
     rm -rf -- "$worktree/.github/workflows"
   fi
   rm -f -- "$worktree/.coderabbit.yaml"
@@ -82,12 +117,28 @@ while IFS=$'\t' read -r public_case_id case_id base_ref diff_file; do
     exit 6
   fi
 
-  git -C "$cache" push target "$base_commit:refs/heads/$base_branch" "$head_commit:refs/heads/$head_branch"
+  if [[ "$publish_mode" == "push" ]]; then
+    git -C "$cache" push target "$base_commit:refs/heads/$base_branch" "$head_commit:refs/heads/$head_branch"
+  elif [[ "$publish_mode" == "bundle" ]]; then
+    git -C "$cache" update-ref "refs/heads/$base_branch" "$base_commit"
+    git -C "$cache" update-ref "refs/heads/$head_branch" "$head_commit"
+  else
+    echo "invalid publish mode: $publish_mode" >&2
+    exit 8
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$public_case_id" "$base_commit" "$head_commit" "$source_sha256" \
     "$prepared_patch_id" "$changed_files" "$base_ref" | tee -a "$results"
 
   git -C "$cache" worktree remove --force "$worktree"
 done <"$metadata"
+
+if [[ "$publish_mode" == "bundle" ]]; then
+  mapfile -t bundle_refs < <(git -C "$cache" for-each-ref --format='%(refname)' refs/heads/case/)
+  if [[ "${#bundle_refs[@]}" -gt 0 ]]; then
+    git -C "$cache" bundle create "$workspace/.malpr-builder/prepared-branches.bundle" "${bundle_refs[@]}"
+    git -C "$cache" bundle verify "$workspace/.malpr-builder/prepared-branches.bundle"
+  fi
+fi
 
 echo "Prepared all fixed CodeQL case branches."
